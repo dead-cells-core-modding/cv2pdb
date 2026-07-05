@@ -6,6 +6,7 @@
 #include <string>
 #include <vector>
 #include <unordered_map>
+#include <unordered_set>
 #include "mspdb.h"
 
 typedef unsigned char byte;
@@ -189,6 +190,9 @@ struct DWARF_InfoData
 	// The PEImage for this entry.
 	const PEImage* img = nullptr;
 
+	// The compilation unit that this DIE belongs to.
+	DWARF_CompilationUnitInfo* cu = nullptr;
+
 	// Pointer into the memory-mapped image section where this DIE is located.
 	byte* entryPtr;
 
@@ -261,6 +265,7 @@ struct DWARF_InfoData
 		tag = 0;
 		hasChild = 0;
 		parent = nullptr;
+		cu = nullptr;
 
 		name = 0;
 		linkage_name = 0;

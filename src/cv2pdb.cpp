@@ -100,6 +100,10 @@ bool CV2PDB::cleanup(bool commit)
 	delete [] segFrame2Index;
 	segFrame2Index = 0;
 
+	for (auto* cu : m_dwarfCUs)
+		delete cu;
+	m_dwarfCUs.clear();
+
 	globalTypes = 0;
 	cbGlobalTypes = 0;
 	allocGlobalTypes = 0;
@@ -2836,28 +2840,22 @@ void align(std::vector<char>& v, int algn)
 		v.push_back(0);
 }
 
-int addfile(std::vector<char>& f3, std::vector<char>& f4, const char* s)
+int addfile(std::vector<char>& f3, std::vector<char>& f4, const char* s, std::unordered_map<std::string, int>& fileMap)
 {
-	size_t slen = strlen(s);
-	const char* p = f3.data();
-	size_t plen = strlen(p);
-	int fileno = -1; // don't count initial 0
-	while(plen != slen || strncmp(p, s, slen) != 0)
-	{
-		p += plen + 1;
-		fileno++;
-		if (p - f3.data() >= (ptrdiff_t)f3.size())
-		{
-			size_t pos = f3.size();
-			append(f3, s, slen + 1);
+	auto it = fileMap.find(s);
+	if (it != fileMap.end())
+		return it->second;
 
-			append(f4, (int)pos);
-			append(f4, (int)0); // checksum
-			return fileno * 8;
-		}
-		plen = strlen(p);
-	}
-	return fileno * 8; // offset in source list
+	size_t slen = strlen(s);
+	size_t pos = f3.size();
+	append(f3, s, slen + 1);
+
+	append(f4, (int)pos);
+	append(f4, (int)0); // checksum
+
+	int fileno = (int)fileMap.size() * 8;
+	fileMap[s] = fileno;
+	return fileno;
 }
 
 ////////////////////////////////////////
@@ -2870,6 +2868,35 @@ bool CV2PDB::addSrcLines14()
 	std::vector<char> F2_all; // multiple f2 blocks
 	std::vector<char> F3_buf; // filenames
 	std::vector<char> F4_buf; // file checksums
+	std::unordered_map<std::string, int> fileMap;
+
+	// First pass: estimate sizes to reserve vector capacity
+	{
+		size_t totalLines = 0, totalFiles = 0, totalFilenamesLen = 0;
+		for (int m = 0; m < countEntries; m++)
+		{
+			OMFDirEntry* entry = imgDbg->getCVEntry(m);
+			if (entry->SubSection == sstSrcModule)
+			{
+				OMFSourceModule* sourceModule = imgDbg->CVP<OMFSourceModule>(entry->lfo);
+				totalFiles += sourceModule->cFile;
+				for (int f = 0; f < sourceModule->cFile; f++)
+				{
+					int cvoff = entry->lfo + sourceModule->baseSrcFile[f];
+					OMFSourceFile* sourceFile = imgDbg->CVP<OMFSourceFile>(cvoff);
+					int* lnSegStartEnd = imgDbg->CVP<int>(cvoff + 4 + 4 * sourceFile->cSeg);
+					BYTE* pname = (BYTE*)(lnSegStartEnd + 2 * sourceFile->cSeg);
+					int namelen = pname ? (int)strlen(p2c(pname)) : 0;
+					totalFilenamesLen += namelen + 1;
+					for (int s = 0; s < sourceFile->cSeg; s++)
+						totalLines += sourceFile->cSeg > 0 ? sourceFile->cSeg : 1;
+				}
+			}
+		}
+		F3_buf.reserve(totalFilenamesLen + 256);
+		F4_buf.reserve(totalFiles * 8 + 256);
+		F2_all.reserve(totalLines * 16 + 4096);
+	}
 
 	append(F3_buf, (char)0); // empty string
 
@@ -2894,7 +2921,7 @@ bool CV2PDB::addSrcLines14()
 				BYTE* pname = (BYTE*)(lnSegStartEnd + 2 * sourceFile->cSeg);
 				char* name = p2c (pname);
 
-				int fileid = addfile(F3_buf, F4_buf, name);
+				int fileid = addfile(F3_buf, F4_buf, name, fileMap);
 
 				for (int s = 0; s < sourceFile->cSeg; s++)
 				{
@@ -2939,6 +2966,7 @@ bool CV2PDB::addSrcLines14()
 	}
 
 	std::vector<char> buf;
+	buf.reserve(F3_buf.size() + F4_buf.size() + F2_all.size() + 4096);
 	append(buf, (int)4);
 	if (F3_buf.size() > 0)
 	{
@@ -2995,6 +3023,10 @@ bool CV2PDB::addPublics()
 				case S_PUB_V1:
 					char symname[kMaxNameLen];
 					dsym2c((BYTE*)sym->data_v1.p_name.name, sym->data_v1.p_name.namelen, symname, sizeof(symname));
+
+					if (!m_addedPublics.insert(symname).second)
+						break; // already added
+
 					int type = translateType(sym->data_v1.symtype);
 					if (debug & DbgPdbSyms)
 						fprintf(stderr, "%s:%d: AddPublic2 %s\n", __FUNCTION__, __LINE__, (const char *)symname);
@@ -3026,6 +3058,7 @@ bool CV2PDB::initGlobalSymbols()
 			OMFSymHash* header = (OMFSymHash*) symbols;
 			globalSymbols = symbols + sizeof(OMFSymHash);
 			cbGlobalSymbols = header->cbSymbol;
+			scanUdtSymbols(globalSymbols, cbGlobalSymbols);
 		}
 		if (entry->SubSection == sstStaticSym)
 		{
@@ -3033,6 +3066,7 @@ bool CV2PDB::initGlobalSymbols()
 			OMFSymHash* header = (OMFSymHash*) symbols;
 			staticSymbols = symbols + sizeof(OMFSymHash);
 			cbStaticSymbols = header->cbSymbol;
+			scanUdtSymbols(staticSymbols, cbStaticSymbols);
 		}
 	}
 	return true;
@@ -3290,28 +3324,8 @@ bool isUDTid(int id)
 codeview_symbol* CV2PDB::findUdtSymbol(int type)
 {
 	type = translateType(type);
-	for(int p = 0; p < cbGlobalSymbols; )
-	{
-		codeview_symbol* sym = (codeview_symbol*) (globalSymbols + p);
-		if(isUDTid(sym->generic.id) && sym->udt_v1.type == type)
-			return sym;
-		p += sym->generic.len + 2;
-	}
-	for(int p = 0; p < cbStaticSymbols; )
-	{
-		codeview_symbol* sym = (codeview_symbol*) (staticSymbols + p);
-		if(isUDTid(sym->generic.id) && sym->udt_v1.type == type)
-			return sym;
-		p += sym->generic.len + 2;
-	}
-	for(int p = 0; p < cbUdtSymbols; )
-	{
-		codeview_symbol* sym = (codeview_symbol*) (udtSymbols + p);
-		if(isUDTid(sym->generic.id) && sym->udt_v1.type == type)
-			return sym;
-		p += sym->generic.len + 2;
-	}
-	return 0;
+	auto it = mapUdtByType.find(type);
+	return it != mapUdtByType.end() ? it->second : 0;
 }
 
 bool isUDT(codeview_symbol* sym, const char* name)
@@ -3323,28 +3337,34 @@ bool isUDT(codeview_symbol* sym, const char* name)
 
 codeview_symbol* CV2PDB::findUdtSymbol(const char* name)
 {
-	for(int p = 0; p < cbGlobalSymbols; )
+	auto it = mapUdtByName.find(name);
+	return it != mapUdtByName.end() ? it->second : 0;
+}
+
+void CV2PDB::registerUdtSymbol(int type, const char* name, codeview_symbol* sym)
+{
+	mapUdtByType[type] = sym;
+	if (name && name[0])
+		mapUdtByName[name] = sym;
+}
+
+void CV2PDB::scanUdtSymbols(unsigned char* buffer, int cb)
+{
+	for (int p = 0; p < cb; )
 	{
-		codeview_symbol* sym = (codeview_symbol*) (globalSymbols + p);
-		if(isUDT(sym, name))
-			return sym;
+		codeview_symbol* sym = (codeview_symbol*)(buffer + p);
+		if (!sym->generic.id)
+			break;
+		if (isUDTid(sym->generic.id))
+		{
+			int type = sym->generic.id == S_UDT_V1 ? sym->udt_v1.type : sym->udt_v2.type;
+			const char* name = sym->generic.id == S_UDT_V1 ? p2c(sym->udt_v1.p_name)
+			                : sym->generic.id == S_UDT_V2 ? p2c(sym->udt_v2.p_name)
+			                : sym->udt_v3.name;
+			registerUdtSymbol(type, name, sym);
+		}
 		p += sym->generic.len + 2;
 	}
-	for(int p = 0; p < cbStaticSymbols; )
-	{
-		codeview_symbol* sym = (codeview_symbol*) (staticSymbols + p);
-		if(isUDT(sym, name))
-			return sym;
-		p += sym->generic.len + 2;
-	}
-	for(int p = 0; p < cbUdtSymbols; )
-	{
-		codeview_symbol* sym = (codeview_symbol*) (udtSymbols + p);
-		if(isUDT(sym, name))
-			return sym;
-		p += sym->generic.len + 2;
-	}
-	return 0;
 }
 
 void CV2PDB::checkUdtSymbolAlloc(int size, int add)
@@ -3367,10 +3387,13 @@ bool CV2PDB::addUdtSymbol(int type, const char* name)
 	// no need to convert to udt_v2/udt_v3, the debugger is fine with it.
 	codeview_symbol* sym = (codeview_symbol*) (udtSymbols + cbUdtSymbols);
 	sym->udt_v2.id = v3 ? S_UDT_V3 : S_UDT_V2;
-	sym->udt_v2.type = translateType(type);
+	int translatedType = translateType(type);
+	sym->udt_v2.type = translatedType;
 	int len = cstrcpy_v(v3, (BYTE*)&sym->udt_v2.p_name, name ? name : ""); // allow anonymous typedefs
 	sym->udt_v2.len = sizeof(sym->udt_v2) - sizeof(sym->udt_v2.p_name) + len - 2;
 	cbUdtSymbols += sym->udt_v2.len + 2;
+
+	registerUdtSymbol(translatedType, name, sym);
 
 	return true;
 }
@@ -3379,12 +3402,12 @@ bool CV2PDB::addSymbols(mspdb::Mod* mod, BYTE* symbols, int cb, bool addGlobals)
 {
 	int prefix = mspdb::vsVersion >= 14 ? 3 : 4; // mod == globmod ? 3 : 4;
 	int words = (cb + cbGlobalSymbols + cbStaticSymbols + cbUdtSymbols + 3) / 4 + prefix;
-	DWORD* data = new DWORD[2 * words + 1000];
+	m_symbolsBuffer.resize(2 * words + 1000);
+	DWORD* data = m_symbolsBuffer.data();
 
 	int databytes = copySymbols(symbols, cb, (BYTE*) (data + prefix), 0);
 
 	bool rc = writeSymbols(mod, data, databytes, prefix, addGlobals);
-	delete [] data;
 	return rc;
 }
 
@@ -3432,10 +3455,9 @@ bool CV2PDB::addSymbols(int iMod, BYTE* symbols, int cb, bool addGlobals)
 bool CV2PDB::addSymbols()
 {
 	int prefix = mspdb::vsVersion >= 14 ? 3 : 4;
-	DWORD* data = 0;
+	m_symbolsBuffer.resize(2 * imgDbg->getCVSize() / 4 + 1000);
+	DWORD* data = m_symbolsBuffer.data();
 	int databytes = 0;
-	if (useGlobalMod)
-		data = new DWORD[2 * imgDbg->getCVSize() + 1000]; // enough for all symbols
 
 	bool addGlobals = true;
 	for (int m = 0; m < countEntries; m++)

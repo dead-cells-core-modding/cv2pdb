@@ -18,6 +18,7 @@
 #include "dwarf.h"
 
 #include <algorithm>
+#include <functional>
 #include <assert.h>
 #include <string>
 #include <vector>
@@ -1036,6 +1037,95 @@ bool CV2PDB::addDWARFProc(DWARF_InfoData& procid, const std::vector<RangeEntry> 
 	return true;
 }
 
+void CV2PDB::processProcChildren(DWARF_InfoData& procid, unsigned int pclo)
+{
+	Location frameBase = decodeLocation(procid.frame_base, 0, DW_AT_frame_base);
+	if (frameBase.is_abs())
+	{
+		DIECursor cursor(procid.cu, procid.entryPtr);
+		frameBase = findBestFBLoc(cursor, frameBase.off);
+	}
+
+	Location cfa = findBestCFA(*imgDbg, cfi_index, procid.pclo, procid.pchi);
+
+	if (!procid.children)
+	{
+		appendEndArg();
+		appendEnd();
+		return;
+	}
+
+	bool endarg = false;
+	int off = 8;
+
+	// First, collect all the formal parameters
+	for (DWARF_InfoData* child = procid.children; child; child = child->next)
+	{
+		if (child->tag == DW_TAG_formal_parameter && child->name)
+		{
+			if (child->location.type == ExprLoc || child->location.type == Block || child->location.type == SecOffset)
+			{
+				Location loc;
+				if (child->location.type == SecOffset)
+				{
+					DIECursor cursor(child->cu, child->entryPtr);
+					loc = findBestFBLoc(cursor, child->location.sec_offset);
+				}
+				else
+				{
+					loc = decodeLocation(child->location, &frameBase);
+				}
+				if (loc.is_regrel())
+					appendStackVar(child->name, getTypeByDWARFPtr(child->type), loc, cfa);
+			}
+		}
+	}
+	appendEndArg();
+
+	// Now process lexical blocks and variables
+	std::vector<DWARF_InfoData*> lexicalBlocks;
+	if (procid.children)
+		lexicalBlocks.push_back(procid.children);
+
+	while (!lexicalBlocks.empty())
+	{
+		DWARF_InfoData* chain = lexicalBlocks.back();
+		lexicalBlocks.pop_back();
+
+		for (DWARF_InfoData* id = chain; id; id = id->next)
+		{
+			if (id->tag == DW_TAG_lexical_block)
+			{
+				if (id->hasChild && id->pchi > id->pclo)
+				{
+					appendLexicalBlock(*id, pclo + codeSegOff);
+					if (id->children)
+						lexicalBlocks.push_back(id->children);
+				}
+			}
+			else if (id->tag == DW_TAG_variable)
+			{
+				if (id->name && (id->location.type == ExprLoc || id->location.type == Block))
+				{
+					Location loc;
+					if (id->location.type == SecOffset)
+					{
+						DIECursor cursor(id->cu, id->entryPtr);
+						loc = findBestFBLoc(cursor, id->location.sec_offset);
+					}
+					else
+					{
+						loc = decodeLocation(id->location, &frameBase);
+					}
+					if (loc.is_regrel())
+						appendStackVar(id->name, getTypeByDWARFPtr(id->type), loc, cfa);
+				}
+			}
+		}
+		appendEnd();
+	}
+}
+
 // Only looks at DW_TAG_member and DW_TAG_inheritance
 int CV2PDB::addDWARFFields(DWARF_InfoData& structid, DIECursor& cursor, int baseoff, int flStart, bool& hasBackRef)
 {
@@ -1691,24 +1781,25 @@ bool CV2PDB::mapTypes()
 	// Scan each compilation unit in '.debug_info'.
 	while (off < imgDbg->debug_info.length)
 	{
-		DWARF_CompilationUnitInfo cu{};
+		DWARF_CompilationUnitInfo* cu = new DWARF_CompilationUnitInfo();
+		m_dwarfCUs.push_back(cu);
 
 		// Read the next compilation unit from 'off' and update it to the next
 		// CU.
-		byte* ptr = cu.read(debug, *imgDbg, &off);
+		byte* ptr = cu->read(debug, *imgDbg, &off);
 		if (!ptr)
 			continue;
 
 		// We only support regular full 'DW_UT_compile' compilation units.
-		if (cu.unit_type != DW_UT_compile) {
+		if (cu->unit_type != DW_UT_compile) {
 			if (debug & DbgDwarfCompilationUnit)
 				fprintf(stderr, "%s:%d: skipping compilation unit offs=%x, unit_type=%d\n", __FUNCTION__, __LINE__,
-						cu.cu_offset, cu.unit_type);
+						cu->cu_offset, cu->unit_type);
 
 			continue;
 		}
 
-		DIECursor cursor(&cu, ptr);
+		DIECursor cursor(cu, ptr);
 
 		// Set up link to ensure this CU links to the prior one.
 		cursor.prevNode = firstNode;
@@ -1719,6 +1810,9 @@ bool CV2PDB::mapTypes()
 		while ((node = cursor.readNext(nullptr)) != nullptr)
 		{
 			DWARF_InfoData& id = *node;
+
+			// Store the CU reference for later tree traversal
+			node->cu = cu;
 
 			// Initialize the head of the DWARF DIE list the first time.
 			if (!dwarfHead) {
@@ -1788,7 +1882,8 @@ bool CV2PDB::mapTypes()
 	return true;
 }
 
-// Walks the .debug_info section and builds a DIE tree.
+// Walks the DWARF tree built by mapTypes() and emits CodeView types.
+// This avoids re-reading and re-decoding the .debug_info section.
 bool CV2PDB::createTypes()
 {
 	img.createSymbolCache();
@@ -1800,44 +1895,18 @@ bool CV2PDB::createTypes()
 	int pointerAttr = img.isX64() ? 0x1000C : 0x800A;
 
 	if (debug & DbgBasic)
-		fprintf(stderr, "%s:%d: createTypes()\n", __FUNCTION__, __LINE__);
+		fprintf(stderr, "%s:%d: createTypes() via tree traversal\n", __FUNCTION__, __LINE__);
 
-	unsigned long off = 0;
-
-	// Scan each compilation unit in '.debug_info'.
-	while (off < imgDbg->debug_info.length)
-	{
-		DWARF_CompilationUnitInfo cu{};
-
-		// Read the next compilation unit from 'off' and update it to the next
-		// CU, returning the pointer just beyond the header to the first DIE.
-		byte* ptr = cu.read(debug, *imgDbg, &off);
-		if (!ptr)
-			continue;
-
-		if (cu.unit_type != DW_UT_compile) {
-			if (debug & DbgDwarfCompilationUnit)
-				fprintf(stderr, "%s:%d: skipping compilation unit offs=%x, unit_type=%d\n", __FUNCTION__, __LINE__,
-						cu.cu_offset, cu.unit_type);
-
-			continue;
-		}
-
-		DIECursor cursor(&cu, ptr);
-
-		DWARF_InfoData* node = nullptr;
-		bool setFirstNode = false;
-		DWARF_InfoData id;
-
-		// Scan the DIEs in this CU, reusing the elements.
-		while (cursor.readNext(&id))
+	// Tree traversal helper
+	std::function<bool(DWARF_InfoData*)> traverse = [&](DWARF_InfoData* node) -> bool {
+		for (DWARF_InfoData* n = node; n; n = n->next)
 		{
-			if (debug & DbgDwarfTagRead)
-				fprintf(stderr, "%s:%d: 0x%08x, level = %d, id.code = %d, id.tag = %d\n", __FUNCTION__, __LINE__,
-						cursor.entryOff, cursor.level, id.code, id.tag);
+			DWARF_InfoData& id = *n;
 
-			// Merge in related entries. This relies on the DWARF tree having been built
-			// in the first pass (mapTypes).
+			if (debug & DbgDwarfTagRead)
+				fprintf(stderr, "%s:%d: tree 0x%08x, tag = %d\n", __FUNCTION__, __LINE__,
+						id.entryOff, id.tag);
+
 			if (id.abstract_origin)
 				mergeAbstractOrigin(id, *this);
 			if (id.specification)
@@ -1864,8 +1933,6 @@ bool CV2PDB::createTypes()
 				break;
 
 			case DW_TAG_subrange_type:
-				// It seems we cannot materialize bounds for scalar types in
-				// CodeView, so just redirect to a mere base type.
 				cvtype = appendModifierType(getTypeByDWARFPtr(id.type), 0);
 				break;
 
@@ -1873,22 +1940,28 @@ bool CV2PDB::createTypes()
 			case DW_TAG_structure_type:
 			case DW_TAG_union_type:
 				if (!id.isDecl) {
-					// Only export the non-declaration version of structs/classes.
-					// DWARF emits multiple copies of the same class, some of
-					// which are marked as declarations and lack members, resulting
-					// in an empty struct UDT in the PDB. Then when we encounter
-					// the non-declaration copy we emit it again, but now we
-					// end up with multiple copies of the same UDT in the PDB
-					// and the debugger gets confused.
+					DIECursor cursor(id.cu, id.entryPtr);
+					DWARF_InfoData tmp;
+					cursor.readNext(&tmp); // skip the struct DIE itself
 					cvtype = addDWARFStructure(id, cursor);
 				}
 				break;
 			case DW_TAG_array_type:
-				cvtype = addDWARFArray(id, cursor);
+				{
+					DIECursor cursor(id.cu, id.entryPtr);
+					DWARF_InfoData tmp;
+					cursor.readNext(&tmp);
+					cvtype = addDWARFArray(id, cursor);
+				}
 				break;
 
 			case DW_TAG_enumeration_type:
-				cvtype = addDWARFEnum(id, cursor);
+				{
+					DIECursor cursor(id.cu, id.entryPtr);
+					DWARF_InfoData tmp;
+					cursor.readNext(&tmp);
+					cvtype = addDWARFEnum(id, cursor);
+				}
 				break;
 
 			case DW_TAG_subroutine_type:
@@ -1899,10 +1972,10 @@ bool CV2PDB::createTypes()
 			case DW_TAG_packed_type:
 			case DW_TAG_thrown_type:
 			case DW_TAG_volatile_type:
-			case DW_TAG_restrict_type: // DWARF3
+			case DW_TAG_restrict_type:
 			case DW_TAG_interface_type:
 			case DW_TAG_unspecified_type:
-			case DW_TAG_mutable_type: // withdrawn
+			case DW_TAG_mutable_type:
 			case DW_TAG_shared_type:
 			case DW_TAG_rvalue_reference_type:
 				cvtype = appendPointerType(0x74, pointerAttr);
@@ -1911,35 +1984,44 @@ bool CV2PDB::createTypes()
 			case DW_TAG_subprogram:
 				if (id.name)
 				{
-					std::vector<RangeEntry> ranges = getRanges(cursor, id);
-					if (!ranges.empty())
+					if (id.pchi > id.pclo || id.ranges != ~0u)
 					{
-						if (!id.is_artificial)
+						std::vector<RangeEntry> ranges;
+						DIECursor subcursor(id.cu, id.entryPtr);
+						DWARF_InfoData tmp;
+						subcursor.readNext(&tmp); // skip the subprogram DIE
+						if (id.ranges != ~0u && id.cu)
 						{
-							std::uint64_t entry_point = ranges.front().pclo;
-							if (debug & DbgPdbSyms)
-								fprintf(stderr, "%s:%d: Adding a public: %s at %llx\n", __FUNCTION__, __LINE__, id.name, entry_point);
-
-							mod->AddPublic2(id.name, img.text.secNo + 1, entry_point - codeSegOff, 0);
+							ranges = getRanges(subcursor, id);
 						}
+						else
+						{
+							ranges.push_back({ id.pclo, id.pchi });
+						}
+						if (!ranges.empty())
+						{
+							if (!id.is_artificial)
+							{
+								std::uint64_t entry_point = ranges.front().pclo;
+								if (m_addedPublics.insert(id.name).second)
+								{
+									if (debug & DbgPdbSyms)
+										fprintf(stderr, "%s:%d: Adding a public: %s at %llx\n", __FUNCTION__, __LINE__, id.name, entry_point);
+									mod->AddPublic2(id.name, img.text.secNo + 1, entry_point - codeSegOff, 0);
+								}
+							}
 
-						// Only add the definition, not declaration, because
-						// MSVC toolset only produces a single symbol for
-						// each function and will get confused if there are
-						// 2 PDB symbols for the same routine.
-						//
-						// TODO: Add more type info to the routine. Today we
-						// expose it as "T_NOTYPE" when we could do better.
-						if (!id.isDecl) {
-							addDWARFProc(id, ranges, cursor);
+							if (!id.isDecl) {
+								addDWARFProc(id, ranges, subcursor);
+							}
 						}
 					}
 				}
 				break;
 
 			case DW_TAG_compile_unit:
-				// Set the implicit base address for range lists.
-				cu.base_address = id.pclo;
+				if (id.cu)
+					id.cu->base_address = id.pclo;
 				switch (id.language)
 				{
 				case DW_LANG_Ada83:
@@ -1958,34 +2040,6 @@ bool CV2PDB::createTypes()
 				default:
 					currentDefaultLowerBound = 0;
 				}
-#if !FULL_CONTRIB
-				if (id.dir && id.name)
-				{
-					if (id.ranges > 0 && id.ranges < imgDbg->debug_ranges.length)
-					{
-						RangeEntry range;
-						RangeCursor rangeCursor(cursor, id.ranges);
-						while (rangeCursor.readNext(range))
-						{
-							if (debug & DbgPdbContrib)
-								fprintf(stderr, "%s:%d: Adding a section contrib: %I64x-%I64x\n", __FUNCTION__, __LINE__,
-										range.pclo, range.pchi);
-
-							if (!addDWARFSectionContrib(mod, range.pclo, range.pchi))
-								return false;
-						}
-					}
-					else
-					{
-						if (debug & DbgPdbContrib)
-							fprintf(stderr, "%s:%d: Adding a section contrib: %x-%x\n", __FUNCTION__, __LINE__,
-									id.pclo, id.pchi);
-
-						if (!addDWARFSectionContrib(mod, id.pclo, id.pchi))
-							return false;
-					}
-				}
-#endif
 				break;
 
 			case DW_TAG_variable:
@@ -2019,11 +2073,12 @@ bool CV2PDB::createTypes()
 						if (dllimport)
 						{
 							checkDWARFTypeAlloc(100);
-							cbDwarfTypes += addPointerType(dwarfTypes + cbDwarfTypes, type, pointerAttr | 0x20); // needs to be deduplicted?
+							cbDwarfTypes += addPointerType(dwarfTypes + cbDwarfTypes, type, pointerAttr | 0x20);
 							type = nextDwarfType++;
 						}
 						appendGlobalVar(id.name, type, seg + 1, segOff);
-						int rc = mod->AddPublic2(id.name, seg + 1, segOff, type);
+						if (m_addedPublics.insert(id.name).second)
+							mod->AddPublic2(id.name, seg + 1, segOff, type);
 					}
 				}
 				break;
@@ -2039,14 +2094,24 @@ bool CV2PDB::createTypes()
 
 			if (cvtype >= 0)
 			{
-				assert(cvtype == typeID); 
+				assert(cvtype == typeID);
 				typeID++;
 
 				assert(mapEntryPtrToTypeID[id.entryPtr] == cvtype);
 				assert(typeID == nextUserType);
 			}
 		}
-	}
+
+		// Recurse into first child, then its siblings via the outer loop
+		if (node->children)
+			if (!traverse(node->children))
+				return false;
+
+		return true;
+	};
+
+	if (!traverse(dwarfHead))
+		return false;
 
 	assert(typeID == nextUserType);
 	assert(typeID == firstUserType + mapEntryPtrToTypeID.size());

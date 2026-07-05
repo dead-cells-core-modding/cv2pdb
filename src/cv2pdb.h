@@ -145,6 +145,8 @@ public:
 	codeview_symbol* findUdtSymbol(int type);
 	codeview_symbol* findUdtSymbol(const char* name);
 	bool addUdtSymbol(int type, const char* name);
+	void registerUdtSymbol(int type, const char* name, codeview_symbol* sym);
+	void scanUdtSymbols(unsigned char* buffer, int cb);
 	void ensureUDT(int type, const codeview_type* cvtype);
 
 	// returns new destSize
@@ -176,6 +178,7 @@ public:
 
 	bool addDWARFSectionContrib(mspdb::Mod* mod, unsigned long pclo, unsigned long pchi);
 	bool addDWARFProc(DWARF_InfoData& id, const std::vector<RangeEntry> &ranges, DIECursor cursor);
+	void processProcChildren(DWARF_InfoData& procid, unsigned int pclo);
 	void formatFullyQualifiedName(const DWARF_InfoData* node, char* buf, size_t cbBuf) const;
 
 	int  addDWARFStructure(DWARF_InfoData& id, DIECursor cursor);
@@ -299,6 +302,19 @@ public:
 
 	// Head of list of DWARF DIE nodes.
 	DWARF_InfoData* dwarfHead = nullptr;
+
+	// Heap-allocated compilation units for tree-based type creation
+	std::vector<DWARF_CompilationUnitInfo*> m_dwarfCUs;
+
+	// Hash maps for O(1) UDT symbol lookup
+	std::unordered_map<int, codeview_symbol*> mapUdtByType;
+	std::unordered_map<std::string, codeview_symbol*> mapUdtByName;
+
+	// Reusable buffer for symbol data to avoid repeated allocations
+	std::vector<DWORD> m_symbolsBuffer;
+
+	// Track already-added public names to avoid redundant COM calls
+	std::unordered_set<std::string> m_addedPublics;
 
 	// Default lower bound for the current compilation unit. This depends on
 	// the language of the current unit.
